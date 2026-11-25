@@ -13,7 +13,7 @@ Can also automatically set freedesktop user profile pictures thus available via 
 
 ## How to install for SSSD
 
-1. Install requirements: `apt install python3-ldb python3-fusepy python3-pydbus python3-apscheduler`
+1. Install requirements: `apt install python3-ldb python3-pyfuse3 python3-bidict python3-pydbus python3-apscheduler`
 2. Instruct SSSD to cache user photos: in `/etc/sssd/sssd.conf`, add `ldap_user_extra_attrs = jpegPhoto` under your LDAP domain heading
 3. Install application: `cp ldb-fuse.py /usr/local/sbin/ldb-fuse`
 4. Install systemd service:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-ldb-fuse v0.4.
+ldb-fuse v1.0.
 FUSE mount for LDAP information (e.g. user jpegPhoto, sudoers, etc.) in LDB files (e.g. SSSD cache).
 Exported file/directory structure for photos:
   /                               (root)
@@ -16,20 +16,23 @@ Exported file/directory structure for photos:
 
 from argparse import ArgumentParser, RawTextHelpFormatter
 from os.path import isdir
-from os import makedirs, removedirs
+from os import O_WRONLY, O_RDWR, makedirs, removedirs, fsencode, fsdecode
 from socket import gethostname
 from datetime import datetime
+
+import pyfuse3
+import trio
+from bidict import bidict
 from imghdr import what as imghdr_what
 from filecmp import cmp
-from errno import ENOENT
+from errno import ENOENT, EROFS
 from ldb import Ldb, FLG_RDONLY
-from fusepy import FUSE, Operations, FuseOSError
 from apscheduler.schedulers.background import BackgroundScheduler
 from pydbus import SystemBus
 
 DEFAULT_MOUNTPOINT = "/run/ldb-fuse/"
 LOGIN_ICON_CHECK_FREQ_MINS = 30
-
+NANOSECONDS_PER_SECOND = 1000 * 1000 * 1000
 
 class User:
     __slots__ = "name", "uidNumber", "originalModifyTimestamp", "jpegPhoto", "thumbnailPhoto"
@@ -60,12 +63,12 @@ class User:
 
     def photo_filename(self):
         if not self.jpegPhoto:
-            raise FuseOSError(ENOENT)
+            raise pyfuse3.FUSEError(ENOENT)
         return "photo." + self.photo_file_extension()
 
     def thumbnail_filename(self):
         if not self.thumbnailPhoto:
-            raise FuseOSError(ENOENT)
+            raise pyfuse3.FUSEError(ENOENT)
         return "thumbnail." + self.thumbnail_file_extension()
 
 
@@ -120,66 +123,181 @@ class UserDataProvider:
         return ("\n".join(self.get_sudoers(hostname))+"\n").encode()
 
 
-class LDBFuse(Operations):
+class InodeMap:
+    """
+    Object to link paths to the inode allocated to them. Allows bidirectional lookup.
+    Note that this object is purely to match paths to inodes, it does not prescribe anything else about the filesystem.
+    In particular, It presupposes any path passed to get_inode() is valid, and will allocate an inode if none exists.
+    """
+
+    def __init__(self):
+        self._map = bidict()
+        self._map["/"] = pyfuse3.ROOT_INODE
+        self._next_inode = pyfuse3.ROOT_INODE + 1
+
+    def get_inode(self, path: str):
+        """Return inode for the path of a file in the FUSE mount. If this inode doesn't exist, allocate it."""
+        try:
+            return self._map[path]
+        except KeyError:
+            new_inode = self._next_inode
+            self._map[path] = new_inode
+            self._next_inode += 1
+            return new_inode
+
+    def get_path(self, inode: int):
+        """Return a file's path in the FUSE mount from its inode."""
+        try:
+            return self._map.inverse[inode]
+        except KeyError:
+            return pyfuse3.FUSEError(ENOENT)
+
+
+class FileHandleMap:
+    """
+    Links an inode to a sequentially generated integer, i.e. file handle.
+    This is a read-only file system and I'm lazy, so there's no 'unregister' functionality for now.
+    """
+    def __init__(self):
+        self._map = {}
+        self._next_filehandle = 1
+
+    def register(self, inode: int):
+        """Generate a new file handle and return it to the caller."""
+        filehandle = self._next_filehandle
+        self._map[filehandle] = inode
+        self._next_filehandle += 1
+        return filehandle
+
+    def get_inode(self, filehandle: int):
+        """Look up and return an inode from a file handle."""
+        return self._map[filehandle]
+
+
+class LDBFuse(pyfuse3.Operations):
     """
     Implements necessary methods to expose to FUSE.
     """
-    def __init__(self, user_data_provider):
+
+    def __init__(self, user_data_provider: UserDataProvider):
+        super().__init__()
+        self._inodes = InodeMap()
+        self._filehandles = FileHandleMap()
         self.provider = user_data_provider
 
     @staticmethod
-    def _generate_dir_stat(atime=0, ctime=0, mtime=0, gid=0, uid=0, mode=0o40555, nlink=0, size=0):
+    def _generate_dir_stat(st_ino=0, atime=0, ctime=0, mtime=0, gid=0, uid=0, mode=0o40555, nlink=0, size=0):
         # File mode for a directory r/x by all and w by no-one: 040555
-        return {"st_atime": atime, "st_ctime": ctime, "st_mtime": mtime,
-                "st_gid": gid, "st_uid": uid,
-                "st_mode": mode, "st_nlink": nlink, "st_size": size
-                }
+        stat = pyfuse3.EntryAttributes()
+        stat.st_ino = st_ino
+        stat.generation = 0  # unused
+        stat.entry_timeout = 300
+        stat.attr_timeout = 300
+        stat.st_atime_ns = atime * NANOSECONDS_PER_SECOND
+        stat.st_ctime_ns = ctime * NANOSECONDS_PER_SECOND
+        stat.st_mtime_ns = mtime * NANOSECONDS_PER_SECOND
+        stat.st_gid = gid
+        stat.st_uid = uid
+        stat.st_mode = mode
+        stat.st_nlink = nlink
+        stat.st_size = size
+        return stat
 
     @staticmethod
-    def _generate_file_stat(atime=0, ctime=0, mtime=0, gid=0, uid=0, mode=0o100444, nlink=0, size=0):
+    def _generate_file_stat(st_ino=0, atime=0, ctime=0, mtime=0, gid=0, uid=0, mode=0o100444, nlink=0, size=0):
         # File mode for a file r by all and w/x by no-one: 0100444
-        return {"st_atime": atime, "st_ctime": ctime, "st_mtime": mtime,
-                "st_gid": gid, "st_uid": uid,
-                "st_mode": mode, "st_nlink": nlink, "st_size": size
-                }
+        stat = pyfuse3.EntryAttributes()
+        stat.st_ino = st_ino
+        stat.generation = 0  # unused
+        stat.entry_timeout = 300
+        stat.attr_timeout = 300
+        stat.st_atime_ns = atime * NANOSECONDS_PER_SECOND
+        stat.st_ctime_ns = ctime * NANOSECONDS_PER_SECOND
+        stat.st_mtime_ns = mtime * NANOSECONDS_PER_SECOND
+        stat.st_gid = gid
+        stat.st_uid = uid
+        stat.st_mode = mode
+        stat.st_nlink = nlink
+        stat.st_size = size
+        return stat
 
-    def getattr(self, path, fh=None):
-        """Returns filesystem attributes (type of file object, permissions, etc)"""
+    def _attr_by_path(self, path: str):
+        """Translation layer for lookup() and getattr() that works by path instead of inode."""
+
         match path.strip("/").split("/"):
 
             case [""] | ["users"]:
                 # Main root or all users subfolder
-                return self._generate_dir_stat()
+                return self._generate_dir_stat(st_ino=self._inodes.get_inode(path))
 
             case ["users", username] if user := self.provider.get_user(username):
                 # Individual user's subfolder
                 epoch_modified = int(datetime.strptime(user.originalModifyTimestamp, "%Y%m%d%H%M%SZ").timestamp())
-                return self._generate_dir_stat(mtime=epoch_modified)
+                return self._generate_dir_stat(st_ino=self._inodes.get_inode(path), mtime=epoch_modified)
 
             case ["users", username, filename] if user := self.provider.get_user(username):
                 # Individual file under user's subfolder
                 if filename == user.photo_filename():
                     # Photo file
                     epoch_modified = int(datetime.strptime(user.originalModifyTimestamp, "%Y%m%d%H%M%SZ").timestamp())
-                    return self._generate_file_stat(mtime=epoch_modified, size=len(user.jpegPhoto))
+                    return self._generate_file_stat(st_ino=self._inodes.get_inode(path), mtime=epoch_modified, size=len(user.jpegPhoto))
 
                 if filename == user.thumbnail_filename():
                     # Thumbnail file
                     epoch_modified = int(datetime.strptime(user.originalModifyTimestamp, "%Y%m%d%H%M%SZ").timestamp())
-                    return self._generate_file_stat(mtime=epoch_modified, size=len(user.thumbnailPhoto))
+                    return self._generate_file_stat(st_ino=self._inodes.get_inode(path), mtime=epoch_modified, size=len(user.thumbnailPhoto))
 
-                raise FuseOSError(ENOENT)
+                raise pyfuse3.FUSEError(ENOENT)
 
             case ["sudoers.txt"]:
                 # Sudoers file
-                return self._generate_file_stat(size=len(self.provider.get_sudoers_as_bytes()))
+                return self._generate_file_stat(st_ino=self._inodes.get_inode(path), size=len(self.provider.get_sudoers_as_bytes()))
 
-        raise FuseOSError(ENOENT)
+        raise pyfuse3.FUSEError(ENOENT)
 
-    def readdir(self, path, fh):
+    def _file_data_by_path(self, path: str):
+        """Returns file byte data."""
+
+        match path.strip("/").split("/"):
+
+            case ["users", username, filename] if user := self.provider.get_user(username):
+                # Individual file under user's subfolder
+                if user.jpegPhoto and filename == user.photo_filename():
+                    return user.jpegPhoto
+                if user.thumbnailPhoto and filename == user.thumbnail_filename():
+                    return user.thumbnailPhoto
+                raise pyfuse3.FUSEError(ENOENT)
+
+            case ["sudoers.txt"]:
+                # Sudoers file
+                return self.provider.get_sudoers_as_bytes()
+
+        raise pyfuse3.FUSEError(ENOENT)
+
+    def _file_data_by_inode(self, inode: int):
+        return self._file_data_by_path(self._inodes.get_path(inode))
+
+    async def getattr(self, inode: int, ctx: pyfuse3.RequestContext):
+        """Returns filesystem attributes (type of file object, permissions, etc)"""
+        return self._attr_by_path(self._inodes.get_path(inode))
+
+    async def lookup(self, parent_inode: int, name: bytes, ctx: pyfuse3.RequestContext):
+        """From pyfuse3 docs: "Look up a directory entry by name and get its attributes." """
+        path = self._inodes.get_path(parent_inode) + "/" + fsdecode(name)
+        attr = self._attr_by_path(path)
+        return attr
+
+    async def opendir(self, inode: int, ctx: pyfuse3.RequestContext):
+        # Nothing to do here really. Return inode as filehandle.
+        filehandle = self._filehandles.register(inode)
+        return filehandle
+
+    async def readdir(self, fh: int, start_id: int, token: pyfuse3.ReaddirToken):
         """Yields directory contents."""
         entries = [".", ".."]
 
+        # For dirs, filehandle is inode.
+        path = self._inodes.get_path(self._filehandles.get_inode(fh))
         match path.strip("/").split("/"):
 
             case [""]:
@@ -199,28 +317,34 @@ class LDBFuse(Operations):
                     entries.append(user.thumbnail_filename())
 
             case _:
-                raise FuseOSError(ENOENT)
+                raise pyfuse3.FUSEError(ENOENT)
 
-        yield from entries
+        entries = entries[start_id:]  # Cut down list to requested size
+        for entry_index, entry in enumerate(entries):
+            pyfuse3.readdir_reply(token, fsencode(entry), self._attr_by_path(path), entry_index + 1)
 
-    def read(self, path, length, offset, fh):
-        """Returns file byte data."""
+    async def open(self, inode: int, flags, ctx):
+        if flags & (O_WRONLY | O_RDWR):
+            raise pyfuse3.FUSEError(EROFS)
+        filehandle = self._filehandles.register(inode)
+        return pyfuse3.FileInfo(fh=filehandle, keep_cache=True)
 
-        match path.strip("/").split("/"):
+    async def read(self, fh, offset, length):
+        return self._file_data_by_inode(self._filehandles.get_inode(fh))[offset:offset+length]
 
-            case ["users", username, filename] if user := self.provider.get_user(username):
-                # Individual file under user's subfolder
-                if user.jpegPhoto and filename == user.photo_filename():
-                    return user.jpegPhoto[offset:offset+length]
-                if user.thumbnailPhoto and filename == user.thumbnail_filename():
-                    return user.thumbnailPhoto[offset:offset+length]
-                raise FuseOSError(ENOENT)
-
-            case ["sudoers.txt"]:
-                # Sudoers file
-                return self.provider.get_sudoers_as_bytes()[offset:offset+length]
-
-        raise FuseOSError(ENOENT)
+    async def statfs(self, ctx):
+        """Returns dummy info"""
+        s = pyfuse3.StatvfsData()
+        s.f_bsize = 512
+        s.f_frsize = 512
+        s.f_blocks = 0
+        s.f_bfree = 0
+        s.f_bavail = 0
+        s.f_files = 0
+        s.f_ffree = 0
+        s.f_favail = 0
+        s.f_namemax = 255
+        return s
 
 
 def dbus_set_icon_path(uid, icon_path):
@@ -270,6 +394,15 @@ class Mountpoint:
         removedirs(self.path)
 
 
+class Filesystem:
+    """Very simple context manager that just enforces cleanup with `close()` after using the FS."""
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exception_type, exception_value, exception_traceback):
+        pyfuse3.close(unmount=True)
+
+
 def main():
 
     parser = ArgumentParser(description=__doc__, formatter_class=RawTextHelpFormatter)
@@ -289,8 +422,16 @@ def main():
                           )
         scheduler.start()
 
+    fuse_options = set(pyfuse3.default_options)
+    fuse_options.discard('default_permissions')
+    fuse_options.add('fsname=ldbfuse')
+    if args.allow_other:
+        fuse_options.add('allow_other')
+
     with Mountpoint(args.mountpoint):
-        FUSE(LDBFuse(provider), args.mountpoint, nothreads=True, foreground=True, allow_other=args.allow_other)
+        with Filesystem():
+            pyfuse3.init(LDBFuse(provider), args.mountpoint, fuse_options)
+            trio.run(pyfuse3.main)
 
 
 if __name__ == "__main__":
